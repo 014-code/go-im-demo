@@ -2,8 +2,9 @@ package main
 
 import (
 	"net"
-	"strings"
 	"time"
+
+	"awesomeProject/proto"
 )
 
 // 活跃超时时间
@@ -14,14 +15,15 @@ const activeTimeout = 60 * time.Second
 */
 
 type User struct {
+	//昵称
 	Name string
 	//地址
 	Addr string
-	//对应的con连接
+	//对应的 con 连接
 	Conn net.Conn
-	//对应的消息canl管道
-	C chan string
-	//用户关联的server
+	//对应的消息 chan 管道,广播时服务端往里塞已编码的 JSON 帧
+	C chan []byte
+	//用户关联的 server
 	server *Server
 	//当前用户是否活跃
 	IsLive chan bool
@@ -35,65 +37,61 @@ type User struct {
 
 /*
 *
-发送消息方法，广播给所有用户
-支持指令:
-
-	ping               心跳,服务端回 pong,不广播
-	who                查看在线用户
-	rename|新名字      修改用户名
-	to|用户名|消息内容  私聊指定用户
-	其他               群发广播
+处理一条来自客户端的 Msg
+根据 Type 分发到具体的指令逻辑
 */
-func (this *User) DoMessage(msg string) {
-	lower := strings.ToLower(msg)
-	switch {
+func (this *User) DoMessage(m *proto.Msg) {
+	switch m.Type {
 	//心跳: 直接回 pong,不广播不计入聊天
-	case lower == "ping":
-		this.Send("pong")
-		return
-	//私聊: to|用户名|消息内容
-	case strings.HasPrefix(lower, "to|"):
-		parts := strings.SplitN(msg, "|", 3)
-		if len(parts) < 3 {
-			this.Send("私聊格式错误,正确格式: to|用户名|消息内容")
-			return
-		}
-		targetName := parts[1]
-		content := parts[2]
-		//查目标用户
+	case proto.TypePing:
+		this.Send(&proto.Msg{Type: proto.TypePong, Time: time.Now().Unix()})
+	//私聊
+	case proto.TypePriv:
+		// 目标用户必须存在
 		this.server.MapLock.RLock()
-		target, ok := this.server.UserList[targetName]
+		target, ok := this.server.UserList[m.To]
 		this.server.MapLock.RUnlock()
 		if !ok {
-			this.Send("用户[" + targetName + "]不在线")
+			this.Send(&proto.Msg{Type: proto.TypeErr, Text: "用户[" + m.To + "]不在线"})
 			return
 		}
-		//只推给目标用户
-		target.Send("[" + this.Name + "][私聊]:" + content)
+		//只推给目标用户,标 From
+		target.Send(&proto.Msg{
+			Type: proto.TypePriv,
+			From: this.Name,
+			Text: m.Text,
+			Time: time.Now().Unix(),
+		})
 	//查看在线用户
-	case strings.Contains(lower, "who"):
+	case proto.TypeWho:
+		// 在锁内拷一份名字列表,锁外再发送
 		this.server.MapLock.RLock()
-		defer this.server.MapLock.RUnlock()
-		for _, user := range this.server.UserList {
-			this.Send("[" + user.Name + "]" + user.Addr)
+		names := make([]string, 0, len(this.server.UserList))
+		for name := range this.server.UserList {
+			names = append(names, name)
 		}
-	//改名: rename|新名字
-	case strings.HasPrefix(lower, "rename|"):
-		newName := strings.SplitN(msg, "|", 2)[1]
+		this.server.MapLock.RUnlock()
+		this.Send(&proto.Msg{Type: proto.TypeUsers, List: names})
+	//改名
+	case proto.TypeRename:
+		newName := m.Text
 		this.server.MapLock.Lock()
 		defer this.server.MapLock.Unlock()
-		//名字已存在
+		//新名字已存在
 		if _, exists := this.server.UserList[newName]; exists {
-			this.Send("该用户名已被使用")
+			this.Send(&proto.Msg{Type: proto.TypeErr, Text: "该用户名已被使用"})
 			return
 		}
-		//改名
+		//摘旧名,挂新名
 		delete(this.server.UserList, this.Name)
 		this.Name = newName
 		this.server.UserList[newName] = this
+		this.Send(&proto.Msg{Type: proto.TypeOK, Text: "rename ok"})
 	//默认群发
+	case proto.TypeMsg:
+		this.server.Broadcast(this, m.Text)
+	//登录/重连/系统等帧不该走到这里,忽略
 	default:
-		this.server.Broadcast(this, msg)
 	}
 }
 
@@ -111,7 +109,7 @@ func NewUser(conn net.Conn, server *Server, name string) *User {
 		Name:   name,
 		Addr:   addr,
 		Conn:   conn,
-		C:      make(chan string),
+		C:      make(chan []byte, 16),
 		server: server,
 		IsLive: make(chan bool),
 		Done:   make(chan struct{}),
@@ -120,15 +118,15 @@ func NewUser(conn net.Conn, server *Server, name string) *User {
 
 /*
 *
-上线方法
+上线方法: 把 user 注册到 UserList,广播 join 系统消息
 */
 func (this *User) Online() {
-	//加入到map在线列表中
+	//先注册到在线列表
 	this.server.MapLock.Lock()
 	this.server.UserList[this.Name] = this
 	this.server.MapLock.Unlock()
-	//将消息进行广播，这里广播上线消息
-	this.server.Broadcast(this, "用户已上线")
+	//再广播 join,顺序很重要:新用户得先在列表里,后面收到的 who 才会包含自己
+	this.server.BroadcastSystem(this, proto.ReasonJoin, this.Name+" 加入了聊天")
 }
 
 /*
@@ -137,18 +135,21 @@ func (this *User) Online() {
 通过 close(Done) 通知 ListenMessage / ListenIsLive 退出
 */
 func (this *User) Offline() {
+	//先从在线列表摘掉
 	this.server.MapLock.Lock()
 	delete(this.server.UserList, this.Name)
+	//有 token 的才进宽限期,匿名用户直接释放
 	if this.Token != "" {
 		this.OfflineAt = time.Now()
 		this.server.OfflineList[this.Token] = this
 	}
 	this.server.MapLock.Unlock()
-	this.server.Broadcast(this, "用户已下线")
+	//广播 leave 系统消息
+	this.server.BroadcastSystem(this, proto.ReasonLeave, this.Name+" 离开了聊天")
 	// 关闭 Done,让两个后台 goroutine 退出(防泄漏)
 	select {
 	case <-this.Done:
-		// 已经关闭过
+		//已经关闭过
 	default:
 		close(this.Done)
 	}
@@ -156,23 +157,30 @@ func (this *User) Offline() {
 
 /*
 *
-给自己客户端发消息(自动加 \n)
+发一条 Msg 给自己的连接(自动写成一帧)
 */
-func (this *User) Send(msg string) {
-	_, _ = this.Conn.Write([]byte(msg + "\n"))
+func (this *User) Send(m *proto.Msg) {
+	_ = proto.WriteMsg(this.Conn, m)
 }
 
 /*
 *
 监听当前管道的消息方法
+从 C 拿已编码的 JSON 帧,直接写到 conn
 */
 func (this *User) ListenMessage() {
 	for {
 		select {
 		case <-this.Done:
+			//用户下线,退出
 			return
-		case msg := <-this.C:
-			_, _ = this.Conn.Write([]byte(msg + "\n"))
+		case body, ok := <-this.C:
+			if !ok {
+				//chan 关闭,退出
+				return
+			}
+			//把帧写出去
+			_ = proto.WriteFrame(this.Conn, body)
 		}
 	}
 }
@@ -180,7 +188,7 @@ func (this *User) ListenMessage() {
 /*
 *
 监听用户活跃状态,超时则踢出
-每次 ReceiveMessage 成功读到消息会往 this.IsLive 推一个 true,重置定时器
+每次 ReceiveMessage 成功读到一帧会往 this.IsLive 推一个 true,重置定时器
 如果在 activeTimeout 内没有收到信号,则强制关闭连接并广播下线
 */
 func (this *User) ListenIsLive() {
@@ -192,11 +200,12 @@ func (this *User) ListenIsLive() {
 			timer.Stop()
 		case <-timer.C:
 			//超时未活跃,踢人
-			this.Send("你因超时被踢出")
+			this.Send(&proto.Msg{Type: proto.TypeSystem, Reason: proto.ReasonTimeout, Text: "你因超时被踢出"})
 			_ = this.Conn.Close()
 			this.Offline()
 			return
 		case <-this.Done:
+			//用户主动下线,退出
 			timer.Stop()
 			return
 		}

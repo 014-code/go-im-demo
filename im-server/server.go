@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"sync"
 	"time"
+
+	"awesomeProject/proto"
 )
 
 // 离线宽限期: 断开后用户对象在 OfflineList 保留的时间,期间可用 token 重连
@@ -32,14 +33,14 @@ type Server struct {
 	Ip string
 	//端口
 	Port int
-	//当前在线用户列表map
+	//当前在线用户列表 map
 	UserList map[string]*User
 	//断线后保留的用户,token -> user,宽限期内可重连
 	OfflineList map[string]*User
-	//这个map的锁
+	//这个 map 的锁
 	MapLock *sync.RWMutex
-	//用来广播的消息管道
-	MessageChan chan string
+	//广播管道,放已编码的 JSON body(不是 frame,frame 头由 ListenMessage 加)
+	BroadcastChan chan []byte
 }
 
 /*
@@ -48,16 +49,20 @@ type Server struct {
 */
 func NewServer(ip string, port int) *Server {
 	return &Server{
-		Ip:          ip,
-		Port:        port,
-		UserList:    make(map[string]*User),
-		OfflineList: make(map[string]*User),
-		MapLock:     &sync.RWMutex{},
-		MessageChan: make(chan string),
+		Ip:            ip,
+		Port:          port,
+		UserList:      make(map[string]*User),
+		OfflineList:   make(map[string]*User),
+		MapLock:       &sync.RWMutex{},
+		BroadcastChan: make(chan []byte),
 	}
 }
 
-// 生成一个随机 token
+/*
+*
+生成一个随机 token,作为客户端重连的唯一凭据
+8 字节随机数 + hex 编码,碰撞概率可忽略
+*/
 func genToken() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -66,32 +71,61 @@ func genToken() string {
 
 /*
 *
-消息广播到所有在线的用户chan中
+消息广播到所有在线的用户 chan 中
+body 是已经 JSON 编码好的字节(没加帧头)
+ListenMessage 收到后分发给每个 user.C
 */
 func (this *Server) ListenMessage() {
-	for {
-		msg := <-this.MessageChan
-		this.MapLock.Lock()
+	for body := range this.BroadcastChan {
+		this.MapLock.RLock()
 		for _, user := range this.UserList {
 			// 慢用户的 chan 满了就跳过,避免阻塞整条广播
 			select {
-			case user.C <- msg:
+			case user.C <- body:
 			default:
 			}
 		}
-		this.MapLock.Unlock()
+		this.MapLock.RUnlock()
 	}
 }
 
 /*
 *
-广播消息方法
+把 Msg 编码后塞进广播管道
+from 是发消息的用户,会写到 Msg.From 字段
+text 是消息文本
 */
-func (this *Server) Broadcast(user *User, msg string) {
-	//拿到当前发消息的用户
-	message := "[" + user.Addr + "]" + user.Name + ":" + msg
-	//把这个消息给到消息广播器
-	this.MessageChan <- message
+func (this *Server) Broadcast(from *User, text string) {
+	body, err := proto.Encode(&proto.Msg{
+		Type: proto.TypeMsg,
+		From: from.Name,
+		Text: text,
+		Time: time.Now().Unix(),
+	})
+	if err != nil {
+		return
+	}
+	//可能阻塞,但听者必须保证不停从 chan 取
+	this.BroadcastChan <- body
+}
+
+/*
+*
+广播一条系统消息(join/leave/kick/timeout)
+不带 From,带 Reason 和 Text
+*/
+func (this *Server) BroadcastSystem(from *User, reason, text string) {
+	body, err := proto.Encode(&proto.Msg{
+		Type:   proto.TypeSystem,
+		Reason: reason,
+		Text:   text,
+		Time:   time.Now().Unix(),
+	})
+	if err != nil {
+		return
+	}
+	_ = from
+	this.BroadcastChan <- body
 }
 
 /*
@@ -102,15 +136,18 @@ name 已存在则拒绝
 func (this *Server) loginUser(con net.Conn, name string) *User {
 	this.MapLock.Lock()
 	defer this.MapLock.Unlock()
+	//重名直接拒
 	if _, exists := this.UserList[name]; exists {
-		_, _ = con.Write([]byte("login failed: 名字[" + name + "]已被使用\n"))
+		_ = proto.WriteMsg(con, &proto.Msg{Type: proto.TypeErr, Text: "名字[" + name + "]已被使用"})
 		_ = con.Close()
 		return nil
 	}
+	//建用户对象
 	user := NewUser(con, this, name)
 	user.Token = genToken()
 	this.UserList[name] = user
-	_, _ = con.Write([]byte("login ok,token=" + user.Token + "\n"))
+	//回 ok + token
+	_ = proto.WriteMsg(con, &proto.Msg{Type: proto.TypeOK, Text: "login", Token: user.Token})
 	return user
 }
 
@@ -126,15 +163,16 @@ func (this *Server) reconnectUser(con net.Conn, token string) *User {
 	if !ok {
 		return nil
 	}
+	//从离线列表摘掉
 	delete(this.OfflineList, token)
-	// 替换连接和通道
+	//替换连接和通道
 	user.Conn = con
-	user.C = make(chan string)
+	user.C = make(chan []byte, 16)
 	user.IsLive = make(chan bool)
 	user.Done = make(chan struct{})
-	// 重新放回在线列表
+	//重新放回在线列表
 	this.UserList[user.Name] = user
-	// 启动两个后台 goroutine
+	//启动两个后台 goroutine
 	go user.ListenMessage()
 	go user.ListenIsLive()
 	return user
@@ -150,6 +188,7 @@ func (this *Server) cleanupOffline() {
 	for now := range ticker.C {
 		this.MapLock.Lock()
 		for token, u := range this.OfflineList {
+			//过期的就清掉
 			if now.Sub(u.OfflineAt) > offlineGracePeriod {
 				delete(this.OfflineList, token)
 			}
@@ -160,7 +199,7 @@ func (this *Server) cleanupOffline() {
 
 /*
 *
-业务入口: 读首条消息决定 login / reconnect / 匿名,
+业务入口: 读首条消息决定 login / reconnect / 匿名
 然后再进入正常的读消息循环
 */
 func (this *Server) Handler(con net.Conn) {
@@ -172,50 +211,48 @@ func (this *Server) Handler(con net.Conn) {
 
 	// 读首条消息(给个超时,避免慢连接占资源)
 	_ = con.SetReadDeadline(time.Now().Add(firstMsgTimeout))
-	buf := make([]byte, 4096)
-	n, err := con.Read(buf)
+	first, err := proto.ReadMsg(con)
 	_ = con.SetReadDeadline(time.Time{})
-	if err != nil || n == 0 {
+	if err != nil {
 		_ = con.Close()
 		return
 	}
-	first := strings.TrimRight(string(buf[:n]), "\r\n")
 
 	var user *User
-	lower := strings.ToLower(first)
-	switch {
-	case strings.HasPrefix(lower, "reconnect|"):
-		token := strings.SplitN(first, "|", 2)[1]
-		u := this.reconnectUser(con, token)
+	switch first.Type {
+	//显式重连
+	case proto.TypeReconnect:
+		u := this.reconnectUser(con, first.Token)
 		if u == nil {
-			_, _ = con.Write([]byte("reconnect failed: token 失效或不存在\n"))
+			_ = proto.WriteMsg(con, &proto.Msg{Type: proto.TypeErr, Text: "reconnect 失败: token 失效或不存在"})
 			_ = con.Close()
 			return
 		}
-		_, _ = con.Write([]byte("reconnect ok\n"))
+		_ = proto.WriteMsg(con, &proto.Msg{Type: proto.TypeOK, Text: "reconnect"})
 		user = u
 		// reconnectUser 内部已启动 goroutine,这里不再启动
-	case strings.HasPrefix(lower, "login|"):
-		name := strings.SplitN(first, "|", 2)[1]
-		if name == "" {
-			_, _ = con.Write([]byte("login failed: 名字不能为空\n"))
+	//显式登录
+	case proto.TypeLogin:
+		if first.Name == "" {
+			_ = proto.WriteMsg(con, &proto.Msg{Type: proto.TypeErr, Text: "名字不能为空"})
 			_ = con.Close()
 			return
 		}
-		u := this.loginUser(con, name)
+		u := this.loginUser(con, first.Name)
 		if u == nil {
-			return // loginUser 已经回写错误并 close
+			return
 		}
 		user = u
 		go user.ListenMessage()
 		go user.ListenIsLive()
+	//其它当匿名连接处理(用地址当昵称,不生成 token)
 	default:
-		// 兼容旧的匿名连接(用地址当昵称,不生成 token)
 		user = NewUser(con, this, "")
 		go user.ListenMessage()
 		go user.ListenIsLive()
 	}
 
+	//广播上线 + 进入读消息循环
 	user.Online()
 	go this.ReceiveMessage(con, user)
 }
@@ -223,30 +260,26 @@ func (this *Server) Handler(con net.Conn) {
 /*
 *
 接收客户端消息方法
+按帧读取,每读一帧就分发到 DoMessage
 */
 func (this *Server) ReceiveMessage(con net.Conn, user *User) {
 	for {
-		bytes := make([]byte, 4096)
-		n, err := con.Read(bytes)
-		if err != nil && err != io.EOF {
-			fmt.Println("连接读取错误:", err)
+		m, err := proto.ReadMsg(con)
+		if err != nil {
+			//EOF 或网络错都算断开
+			if err != io.EOF {
+				fmt.Println("连接读取错误:", err)
+			}
 			user.Offline()
 			return
 		}
-		if n == 0 {
-			user.Offline()
-			return
-		}
-		//对用户消息去除\n
-		msg := string(bytes[:n-1])
-
-		//重置踢出定时器
+		//成功读到一帧,重置踢人计时
 		select {
 		case user.IsLive <- true:
 		default:
 		}
-
-		user.DoMessage(msg)
+		//分发
+		user.DoMessage(m)
 	}
 }
 
@@ -257,20 +290,20 @@ func (this *Server) ReceiveMessage(con net.Conn, user *User) {
 func (this *Server) Start() {
 	les, err := net.Listen("tcp", fmt.Sprintf("%s:%d", this.Ip, this.Port))
 	if err != nil {
-		fmt.Println("tcp连接建立失败：", err)
+		fmt.Println("tcp连接建立失败:", err)
 		return
 	}
 	defer les.Close()
 
-	// 消息广播 goroutine
+	//消息广播 goroutine
 	go this.ListenMessage()
-	// 离线用户清理 goroutine
+	//离线用户清理 goroutine
 	go this.cleanupOffline()
 
 	for {
 		conn, err := les.Accept()
 		if err != nil {
-			fmt.Println("accept失败：", err)
+			fmt.Println("accept失败:", err)
 			continue
 		}
 		go this.Handler(conn)
